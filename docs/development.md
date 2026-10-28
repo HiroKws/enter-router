@@ -341,6 +341,41 @@ app/       合成ルート: main.py（配線・AppController 実装）/ sink_run
 | 停止時にキーを飲み込んだままにしない | 保留は必ず 1 回配信（I1/I7）。PANIC 後のイベントは全て素通し |
 | ログ | `app/logsetup.py`（1MB×3）。決定ログは op/meaning/resolved/decision のみ、**本文は書かない** |
 
+## ブラウザ照合の落とし穴（2026-10-28 実測）
+
+### 1. タイトル完全一致の登録は Web アプリで壊れる
+
+`Alt+F3`（プロセス＋タイトル登録）は**その瞬間のタイトルをリテラル化**して保存します。
+Claude のような SPA は会話ごとにタイトルを変えるため（登録時
+`新規チャット - Claude — Mozilla Firefox` → 実測時 `Greeting - Claude — Mozilla Firefox`）、
+以後どのプロファイルにも一致せず `resolved=pass`（＝素通し＝アプリ既定の Enter 動作）に
+なります。ログでは `decision=DELIVER op=enter meaning=newline … resolved=pass` が証拠です。
+ブラウザでは `Alt+F2`（プロセスのみ）か `*Claude — Mozilla Firefox` のような
+**ワイルドカード**、または下記の URL 照合を使ってください。
+
+### 2. Firefox では URL が読めなかった（修正済み）
+
+旧 `platform/textcap_win.get_document_url` は
+`AccessibleObjectFromWindow(hwnd, OBJID_CLIENT)` の**ルート**の `accValue` しか読んでおらず、
+Firefox では常に `None` でした（＝URL 照合プロファイルは絶対に一致しない）。実測した構造:
+
+- ルート = APPLICATION ノード、`accValue` は空
+- アドレスバー = 子ノード。role `PROGRESSBAR`(0x2E)、value `claude.ai/chat/<id>`
+  （https は表示上カットされている）
+- 各タブの DOCUMENT ノードの value は完全な `https://…`。ただし**非アクティブタブの分も
+  同じ木に並ぶ**ので「木の中のどれか」を使ってはいけない
+
+そこで `core/browser_url.py`（純粋・ユニットテスト付き）に選択規則を分離し、
+`select_document_url_node` が (1) アクティブなページタイトルと一致する DOCUMENT →
+(2) フォーカスされた DOCUMENT → (3) アドレスバー（`https://` を補う）の順で選びます。
+**他タブの URL は使いません**（誤爆防止）。
+
+コスト: クロスプロセス MSAA で実測 **約 2.5ms/ノード**、全探索は 141 ノード・523ms。
+そのため探索はウィンドウごとに**バックグラウンドで 1 回だけ**行い、見つけたノードの
+子 ID 経路（例 `(27, 6, 2)`）をキャッシュ → 以降は 3〜4 回の COM 呼び出し・**約 10ms**。
+経路が解決できなくなったら（レイアウト変更・ブラウザ更新）キャッシュを捨てて再探索します。
+初回だけ URL は `None` を返します（URL 照合プロファイルは一致しない＝安全側）。
+
 ## このカードで検証したこと / 未検証のこと
 
 **検証済み（実行ログは handoff 参照）**
