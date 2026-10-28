@@ -8,9 +8,11 @@ nothing — the exact defect this module removes.
 
 Contract:
 
-* the FIRST unknown of this process shows one notification (tray balloon/toast
-  through ``platform.notify_win``). Once only: a repeating balloon becomes
-  background noise the user learns to ignore, and the log carries the rest.
+* with ``ime_unknown_policy: "process"`` (the risky choice: an unknown Enter is
+  still converted) the FIRST unknown shows one notification. With the default
+  ``"pass"`` an unknown is the documented, correct behaviour — Enter goes to the
+  IME — so it is only logged, never announced: a toast for normal typing is
+  noise (user decision: "軽い動作で通知しない").
 * every unknown is logged as ``ime_state=unknown action=<pass|process>`` together
   with the probe's ``detail`` (which API failed and with what Win32 error), so the
   log answers "why" without a debugger.
@@ -82,7 +84,8 @@ class ImeUnknownReporter:
         else:
             # Still recorded, just not repeated into the log every keystroke.
             log.debug("%s (suppressed)", fields)
-        if self._notified:
+        if action != "process" or self._notified:
+            # Unknown + pass is normal behaviour, not an error worth a toast.
             return False
         self._notified = True
         log.warning("ime_state=unknown notified to the user (first occurrence; "

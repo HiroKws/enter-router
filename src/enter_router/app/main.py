@@ -40,7 +40,7 @@ from enter_router.core import keys as keys_mod
 from enter_router.core import routing
 from enter_router.core.config import (Config, ConfigError, default_config_dict,
                                       parse_config, parse_config_text)
-from enter_router.core.events import VK_RETURN, KeyEvent
+from enter_router.core.events import VK_RETURN, ImeState, KeyEvent
 from enter_router.core.policy import (Decision, EnterPolicyMachine, Outcome,
                                       State)
 from enter_router.core.sinks import SinkContext, SinkResult
@@ -170,6 +170,14 @@ class EnterRouterApp:
         # "ime_state=unknown" must never be silent (card t_dd246e5a): one
         # notification for the first occurrence, then a rate-limited log line.
         self._ime_unknown = ImeUnknownReporter(notify=notify)
+        # v2-h: which window has had text-producing keys since the last Enter.
+        # In かな mode the composition itself is unobservable (Electron composes on
+        # a renderer thread), but "text typed since the last Enter" is not: an
+        # Enter always ends a composition, so text-after-an-Enter means an Enter
+        # would COMMIT, and no text means there is nothing to commit and the router
+        # may take the Enter (single = newline, double = send).
+        self._ime_text_hwnd: int = 0
+        self._ime_text_count: int = 0
         self._sinks: dict[str, object] = build_sinks(config, notify=notify)
         self._machine = self._make_machine(config)
         self._worker = SinkWorker(
@@ -232,17 +240,46 @@ class EnterRouterApp:
                 self._register_foreground(registration, ev.t_ms)
                 return True
             ime = None
+            commit = False
+            if ev.kind == "down" and keys_mod.is_text_vk(ev.vk):
+                hwnd = self._fg.hwnd()
+                if hwnd != self._ime_text_hwnd:
+                    self._ime_text_hwnd, self._ime_text_count = hwnd, 0
+                self._ime_text_count += 1
             if ev.vk == VK_RETURN and ev.kind == "down":
                 from enter_router.platform import ime as ime_mod
-                ime = ime_mod.query_composition(self._fg.hwnd())
-                if ime.composing is None:
+                hwnd = self._fg.hwnd()
+                ime = ime_mod.query_composition(hwnd)
+                if ime.composing is None and ime.source == "ime_native":
+                    # かな入力中: the composition cannot be seen, only its
+                    # consequence. Text since the last Enter => this Enter ends a
+                    # composition (a commit: hand it to the IME, never count it).
+                    # No text => nothing to commit, so it is an ordinary Enter.
+                    commit = (hwnd == self._ime_text_hwnd
+                              and self._ime_text_count > 0)
+                    if not commit:
+                        ime = ImeState(composing=False, source="ime_native_idle",
+                                       detail=ime.detail)
+                    log.debug("ime native commit=%s text_count=%d", commit,
+                              self._ime_text_count)
+                elif ime.composing is None:
                     # Three-valued probe, the third answer is "I could not read
                     # it". Say so (log always, notification once) — the old code
                     # turned this into an unlogged pass-through (t_dd246e5a).
                     self._ime_unknown.report(self._cfg.ime_unknown_policy,
                                              detail=ime.detail, source=ime.source)
+                if commit:
+                    # Visible in the log on purpose: "did the router treat this
+                    # Enter as a conversion commit, or did it take it?" is the
+                    # question every future IME report starts with.
+                    log.info("ime_commit_enter text_count=%d "
+                             "(Enter handed to the IME, not counted)", self._ime_text_count)
+                if commit or ime.composing is True:
+                    # The composition is over: whatever follows starts clean.
+                    self._ime_text_count = 0
             with self._lock:
-                out = self._machine.on_key(ev, ime)
+                out = (self._machine.on_ime_commit(ev) if commit
+                       else self._machine.on_key(ev, ime))
                 self._sync_timer()
             # Every OS effect runs OUTSIDE the state lock. This callback is what
             # a background SendInput waits for, so holding the lock while an
@@ -548,6 +585,12 @@ class EnterRouterApp:
             self._hook_installed = False
             if self._state == "running":
                 self._state = "paused"
+        # The heartbeat source is gone, so the watchdog would see a stale beat a
+        # few seconds later and self-exit with "応答が停止したため終了します" (measured
+        # right after a panic: a second, bogus error toast). A missing hook is not
+        # a hang — the keyboard is already free — so stop the watchdog here.
+        watchdog.stop(self._watchdog_thread)
+        self._watchdog_thread = None
         # The hook thread is gone, so nobody else will drain the hand-off queue;
         # anything still there would be a silently dropped key (I1/I7).
         try:

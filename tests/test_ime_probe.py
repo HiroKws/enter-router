@@ -23,6 +23,100 @@ sys.path.insert(0, str(REPO / "src"))
 from enter_router.platform import ime as ime_mod, win32lib  # noqa: E402
 
 
+class ClassifyCompositionTest(unittest.TestCase):
+    """The pure rule (regression: a false "not_composing" broke Japanese input)."""
+
+    def _c(self, tsf, process=(), mode=None):
+        return ime_mod.classify_composition(tsf, process, mode)
+
+    def test_a_thread_composition_window_wins(self):
+        self.assertEqual(self._c("composing")[0], "composing")
+
+    def test_a_process_wide_composition_window_wins(self):
+        """A Chromium/Electron app composes on a renderer thread, not the UI one."""
+        verdict, why = self._c("not_composing", (ime_mod.COMPOSITION_CLASS,), None)
+        self.assertEqual((verdict, why), ("composing", "tsf_process"))
+
+    def test_native_ime_mode_is_unknown_never_not_composing(self):
+        """THE regression: open + かな must not claim "not composing"."""
+        verdict, why = self._c("not_composing", (), (True, 0x9))   # NATIVE|FULLSHAPE
+        self.assertIsNone(verdict)
+        self.assertIn("ime_native_unobservable", why)
+
+    def test_alphanumeric_ime_mode_is_not_composing(self):
+        verdict, why = self._c("not_composing", (), (True, 0x0))
+        self.assertEqual((verdict, why), ("not_composing", "ime_alnum(conv=0x0)"))
+
+    def test_closed_ime_is_not_composing(self):
+        self.assertEqual(self._c(None, (), (False, 0x9))[0], "not_composing")
+
+    def test_anchor_only_is_unknown_without_a_readable_ime_mode(self):
+        """The anchor alone never proves "no composition" (that broke 日本語入力)."""
+        self.assertIsNone(self._c("not_composing", (), None)[0])
+
+    def test_no_evidence_is_unknown(self):
+        self.assertIsNone(self._c(None, (), None)[0])
+
+
+class JapaneseInputSafetyTest(unittest.TestCase):
+    """End of the probe: what the POLICY sees while typing Japanese.
+
+    Measured failure (v2-h): in an app whose composition the thread scan cannot
+    see, the probe answered "not composing" while the user was composing, the
+    machine swallowed the Enter and injected ``key:shift+enter`` — the IME never
+    committed and Japanese input was unusable. These tests pin the fix.
+    """
+
+    def setUp(self):
+        self._saved = (win32lib.IS_WINDOWS, ime_mod._init_win32,
+                       ime_mod._read_context, ime_mod._gui_thread_info,
+                       ime_mod._tsf_scan, ime_mod.ime_mode,
+                       ime_mod._process_windows, ime_mod._default_ime_wnd,
+                       ime_mod._window_pid)
+        win32lib.IS_WINDOWS = True
+        ime_mod._init_win32 = lambda: None
+        ime_mod._gui_thread_info = lambda tid: {"hwndFocus": 0, "hwndCaret": 0}
+        ime_mod._read_context = lambda hwnd: (None, "ImmGetContext=0 err=5")
+        ime_mod._tsf_scan = lambda tids: ("not_composing", "tsf: anchor only")
+        ime_mod._default_ime_wnd = lambda hwnd: 0xABC
+        ime_mod._window_pid = lambda hwnd: 4242
+        self.mode: tuple[bool, int] | None = (True, 0x9)
+        self.process: tuple[str, ...] = ()
+        ime_mod.ime_mode = lambda wnd: self.mode
+        ime_mod._process_windows = lambda pid: self.process
+        self.probe = ime_mod.CompositionProbe(clock=lambda: 1000.0)
+
+    def tearDown(self):
+        (win32lib.IS_WINDOWS, ime_mod._init_win32, ime_mod._read_context,
+         ime_mod._gui_thread_info, ime_mod._tsf_scan, ime_mod.ime_mode,
+         ime_mod._process_windows, ime_mod._default_ime_wnd,
+         ime_mod._window_pid) = self._saved
+
+    def test_composing_in_japanese_mode_reads_as_unknown_so_enter_passes(self):
+        state = self.probe.query(7)
+        self.assertIsNone(state.composing)          # -> ime_unknown_policy "pass"
+        self.assertIn("ime_native_unobservable", state.detail)
+
+    def test_alphanumeric_mode_still_allows_the_enter_policy(self):
+        self.mode = (True, 0x0)
+        state = self.probe.query(7)
+        self.assertIs(state.composing, False)
+        self.assertEqual(state.source, "ime_alnum")
+
+    def test_a_renderer_thread_composition_is_found_by_the_process_scan(self):
+        self.mode = None                            # IME window unreadable here
+        self.process = (ime_mod.COMPOSITION_CLASS,)
+        state = self.probe.query(7)
+        self.assertIs(state.composing, True)
+        self.assertEqual(state.source, "tsf_process")
+
+    def test_nothing_readable_is_still_unknown(self):
+        self.mode = None
+        self.process = ()
+        state = self.probe.query(7)
+        self.assertIsNone(state.composing)
+
+
 class ProbeTest(unittest.TestCase):
     def setUp(self):
         self._saved = (win32lib.IS_WINDOWS, ime_mod._init_win32,
@@ -123,7 +217,9 @@ class ProbeTest(unittest.TestCase):
         calls_after_first = len(self.read_calls)
         second = self.probe.query(7)          # inside the retry window
         self.assertIsNone(second.composing)
-        self.assertEqual(second.source, "cached")
+        # The cached answer keeps the PROVENANCE of the failure, so the app layer
+        # can still tell "かな mode, invisible composition" from "nothing readable".
+        self.assertEqual(second.source, "unknown")
         self.assertEqual(len(self.read_calls), calls_after_first)  # no new Win32 work
         self.answers[7] = ("composing", "bytes=6")                # it becomes readable
         self.now += 2.1                                            # retry window over
@@ -195,10 +291,15 @@ class TsfStageTest(unittest.TestCase):
         self._saved = (win32lib.IS_WINDOWS, ime_mod._init_win32,
                        ime_mod._gui_thread_info, ime_mod._window_thread,
                        ime_mod._thread_windows, ime_mod.win32lib.dll,
-                       ime_mod._tsf_scan)
+                       ime_mod._tsf_scan, ime_mod.ime_mode)
         win32lib.IS_WINDOWS = True
         ime_mod._init_win32 = lambda: None
         ime_mod._window_thread = lambda hwnd: 42
+        # v2-h: "not composing" needs the IME window's mode as well (the anchor
+        # alone is no longer accepted as proof). Default here = unreadable, i.e.
+        # the blind case; a test that wants a positive answer sets self.mode.
+        self.mode: tuple[bool, int] | None = None
+        ime_mod.ime_mode = lambda wnd: self.mode
         ime_mod._gui_thread_info = lambda tid: {"hwndFocus": 0, "hwndCaret": 0}
         self.windows: dict[int, tuple[tuple[int, str], ...]] = {42: ()}
         ime_mod._thread_windows = lambda tid: self.windows.get(tid, ())
@@ -224,7 +325,7 @@ class TsfStageTest(unittest.TestCase):
     def tearDown(self):
         (win32lib.IS_WINDOWS, ime_mod._init_win32, ime_mod._gui_thread_info,
          ime_mod._window_thread, ime_mod._thread_windows,
-         ime_mod.win32lib.dll, ime_mod._tsf_scan) = self._saved
+         ime_mod.win32lib.dll, ime_mod._tsf_scan, ime_mod.ime_mode) = self._saved
 
     def test_composition_window_is_composing(self):
         """Measured: the window appears only while a composition is alive."""
@@ -236,13 +337,24 @@ class TsfStageTest(unittest.TestCase):
         self.assertEqual(state.source, "tsf_composition")
         self.assertIn("composition=1", state.detail)
 
-    def test_anchor_without_composition_is_not_composing(self):
-        """Absence of a composition window is evidence ONLY with the anchor."""
+    def test_anchor_without_composition_is_not_composing_in_alnum_mode(self):
+        """No composition window IS evidence — together with a readable 英数 IME.
+
+        v2-h: the anchor alone became insufficient (it produced a false
+        "not composing" while typing Japanese). The positive read that replaced it
+        is the IME window's conversion mode.
+        """
         self.windows[42] = ((0x10, "Edit"), (0x12, "MSCTFIME UI"))
+        self.mode = (True, 0x0)                       # IME open, 英数 (no かな)
         state = ime_mod.CompositionProbe().query(0x10)
         self.assertIs(state.composing, False)
         self.assertEqual(state.state, "not_composing")
-        self.assertEqual(state.source, "tsf_ime_ui")
+        self.assertEqual(state.source, "ime_alnum")
+
+    def test_anchor_without_a_readable_ime_mode_is_unknown(self):
+        self.windows[42] = ((0x10, "Edit"), (0x12, "MSCTFIME UI"))
+        state = ime_mod.CompositionProbe().query(0x10)
+        self.assertIsNone(state.composing)            # Enter goes to the IME
 
     def test_no_msctfime_at_all_stays_unknown(self):
         """A TSF-native app must not be reported as 'not composing'."""
@@ -254,6 +366,7 @@ class TsfStageTest(unittest.TestCase):
 
     def test_tsf_answer_is_re_read_every_call(self):
         self.windows[42] = ((0x10, "Edit"), (0x12, "MSCTFIME UI"))
+        self.mode = (True, 0x0)
         probe = ime_mod.CompositionProbe()
         self.assertIs(probe.query(0x10).composing, False)
         self.windows[42] = ((0x10, "Edit"), (0x11, "MSCTFIME Composition"),
@@ -265,6 +378,7 @@ class TsfStageTest(unittest.TestCase):
     def test_imm_is_skipped_after_a_structural_failure(self):
         """No attach attempt per Enter once IMM is known dead for this window."""
         self.windows[42] = ((0x10, "Edit"), (0x12, "MSCTFIME UI"))
+        self.mode = (True, 0x0)                       # a stable, positive answer
         probe = ime_mod.CompositionProbe()
         probe.query(0x10)
         self.assertEqual(self.read_calls, [0x10])       # one probe of the IMM route

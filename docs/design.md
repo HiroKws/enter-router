@@ -225,7 +225,7 @@ hook (platform)
 | HOLDING | IME 未確定開始を検知 | IDLE | DELIVER（ユーザーが先へ進んだ＝待たない） |
 | HOLDING | 設定更新で無効化 | IDLE | DELIVER |
 | 任意 | Enter down だが IME 未確定中（composing=True） | 変化なし | **PASS** + カウントリセット（IME と戦わない） |
-| 任意 | IME 状態が不明（unknown = 照会失敗） | 変化なし | `global.ime_unknown_policy`: `"pass"`（既定）→ **PASS** / `"process"` → 通常の Enter 判定。**どちらでもログ `ime_state=unknown action=…` ＋ 初回のみ通知**（黙って何もしない状態は禁止, t_dd246e5a） |
+| 任意 | IME 状態が不明（unknown = 照会失敗、**または かな入力中で変換が観測できない**） | 変化なし | `global.ime_unknown_policy`: `"pass"`（既定）→ **PASS**（IME に確定させる） / `"process"` → 通常の Enter 判定。**どちらでもログ `ime_state=unknown action=…`、通知は `process` の初回のみ**（黙って何もしない状態は禁止, t_dd246e5a / v2-h） |
 | 任意 | **injected イベント（rule0）** | 変化なし | **PASS**（処理対象外・カウントしない・ループ防止） |
 | 任意 | チャタ（同 vk down が `chatter_debounce_ms`(15) 未満・keyup なし） | 変化なし | IGNORE |
 | 任意 | 修飾付き Enter / F キー等の第1層 combo 成立 | IDLE | **TRIGGER**（抑止 + 解決実行。`key:` は同期 SendInput 可） |
@@ -518,19 +518,48 @@ DRYRUN t=<t_ms> op=<操作キー|-> meaning=<意味|-> profile=<profile_id|-> re
   unknown）で返し、`unknown`（照会失敗）のときの挙動を設定で選ぶ。`"pass"`（既定）は素通し、
   `"process"` は「未確定でない」とみなして通常の Enter 判定を走らせる。**どちらでもログ
   `ime_state=unknown action=<pass|process> source=… occurrences=N detail=<API と Win32 エラー>` を出し、
-  初回のみ通知する**（＝「黙って何もしない」を禁止）。連続時はログを 1 分に 1 回へ間引く。
+  **`process` のときだけ初回に通知する**（v2-h。`pass` の unknown は「かな入力中の正常動作」なので
+  トーストしない＝軽い動作で通知しない方針）。連続時はログを 1 分に 1 回へ間引く。
   `policy` セクション側に書いた場合は無視して既定 `pass` を使い、**警告を出す**（黙って無視しない）。
   プローブは「読めなかった」と「未確定でない」を必ず区別する（前者だけが unknown）。
-  照会は **4 段**で、IMM が他プロセスでは原理的に読めないことを実測で確認したうえで 4 段目に
+  照会は **6 段**で、IMM が他プロセスでは原理的に読めないことを実測で確認したうえで 4 段目に
   TSF の窓走査を置く（t_dd246e5a 実測）:
   ① `AttachThreadInput` + `ImmGetContext(hwnd)`（前面窓） ② 同 `ImmGetDefaultIMEWnd`（IME 窓）
   ③ `GetGUIThreadInfo` の `hwndFocus`/`hwndCaret`（各 1 回の attach 内で読む）
   ④ **`EnumThreadWindows` で対象スレッド（前面窓 + `hwndFocus`/`hwndCaret` のスレッド）の窓クラスを走査**し、
-  `MSCTFIME Composition` が 1 個でもあれば **composing**（非表示でも数える＝陽性のみを許す）、
-  無くて同スレッドに `MSCTFIME UI`（アンカー）があれば **not_composing**、どちらも無ければ **unknown**。
+  `MSCTFIME Composition` が 1 個でもあれば **composing**（非表示でも数える＝陽性のみを許す）。
+  ⑤ **`EnumWindows` で対象プロセス全体（全スレッド）の窓クラスを走査**（v2-h）。Chromium/Electron は
+  変換をレンダラ側スレッドに持つため、スレッド走査では原理的に見つからない（実測: Hermes デスクトップで
+  `composition=0` のまま変換中だった）。
+  ⑥ **`WM_IME_CONTROL` / `IMC_GETOPENSTATUS` + `IMC_GETCONVERSIONMODE` を既定 IME 窓へ送る**（v2-h。
+  この 2 つは `ImmGetContext` と違い**他プロセスでも答える**。実測: 変換中 = `open=1 conv=0x9`）。
+  オンかつ `IME_CMODE_NATIVE`（かな）なら **unknown**、オンかつ英数なら **not_composing**、
+  オフなら **not_composing**。
+  **`not_composing` は必ず ⑥ の陽性の読み取りを伴う**（v2-h でアンカー単独の推論を廃止。アンカーだけでは
+  「変換が無い」証拠にならず、それが日本語入力を壊した）。読めないときは **unknown**＝触らない。
   アンカーが無いアプリ（TSF ネイティブ実装・他社 IME）は**不在を not_composing に読み替えない**
   ＝IME の確定 Enter を壊さない。実測（Win11 + MS-IME、別プロセスの EDIT）: 初期 = `MSCTFIME UI`
   のみで合成窓 0、変換中 = 合成窓 4（うち 1 個 visible）、確定後 = 合成窓 0。プローブ 1 回 0.10ms。
+  **v2-h の速い経路**: ⑥ は 0.1ms なので最初に読み、かな入力中なら ④ だけ走らせて返す
+  （IMM 4 段は初回 46ms かかり、5ms のコールバック予算を超えていた）。
+- **用語（v2-h。この 5 状態で会話・テストする）**:
+  | 記号 | 状態 | 定義 |
+  |---|---|---|
+  | S0 | 日本語入力オフ | IME が閉じている（半角/全角で切った状態）。未確定文字列は存在しない |
+  | S1 | オン・未入力 | かなモードだが未確定文字列が空（例: かなモードに切り替えた直後） |
+  | S2 | オン・かな入力中 | **未確定文字列がある**。ローマ字→かな表示中・変換中・候補選択中を含む。Enter は**確定** |
+  | S3 | オン・確定後 | 未確定文字列が無く、直前まで日本語を入力していた |
+  | S4 | オン・英数入力 | かなモードのまま半角英数を直接入力している（未確定文字列は無い） |
+  ツールが観測できるのは (a) IME のオン/オフ、(b) 変換モード（かな/英数）、
+  (c) 前面プロセスの未確定窓（Electron では見えない）、(d) 直近の Enter 以降に文字キーを打ったか
+  ＝ S2 の代理指標。(d) が真なら S2 とみなして確定として扱い、偽なら S1/S3/S4 として通常判定する。
+- **かな入力中の Enter を「確定」と「普通の Enter」に分ける（v2-h・⑥ が unknown のとき）**:
+  変換そのものが見えない以上、**結果**で判定する。Enter は必ず変換を終わらせるので、
+  1. 直前の Enter 以降に**文字を生むキー**（英数字・記号・space・変換/無変換/かな/漢字）が押されている
+     → この Enter は **確定**。IME に渡し（PASS）、**連続打鍵として数えない**（`on_ime_commit`）。
+  2. 押されていない → 確定すべき変換が無い → **普通の Enter** として通常の判定（1回=改行、2回=送信…）。
+  文字キーの判定は `core/keys.is_text_vk`。窓が変わったら計数を捨てる（他窓の入力を持ち越さない）。
+  これが無いと、確定 Enter が「1回目」として数えられ、**確定後の単発 Enter が送信に化ける**（実測）。
   前面ウィンドウが変わった時だけ経路（`GetGUIThreadInfo`/`ImmGetDefaultIMEWnd`/当たった候補/
   走査対象 tid）を再探索し、**合成状態そのものは毎回読み直す**（打鍵中に変化するため。答えを
   キャッシュすると誤判定）。IMM 3 段が全滅した窓は `_imm_dead` として以後 IMM を試さない

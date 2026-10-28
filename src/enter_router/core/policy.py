@@ -467,7 +467,23 @@ class EnterPolicyMachine:
             # have this Enter — the user moved on, we do not wait (§3.4).
             return self._emit_pending(Decision.DELIVER, self._pending_count,
                                       "ime_composing", swallow=False)
+        self._burst = (0, None)     # a commit is not a burst press (v2-h)
         return self._out(Decision.PASS, False, reason="ime_composing")
+
+    def on_ime_commit(self, ev: KeyEvent) -> Outcome:
+        """An Enter handed to the IME as a conversion commit (v2-h).
+
+        Same handling as a positively observed composition: the Enter belongs to
+        the IME and must NOT count toward a burst. Otherwise the commit press
+        became "press 1" and the next single Enter turned into ``enter2`` (send) —
+        measured: typing Japanese, Enter to commit, then one more Enter sent the
+        message instead of inserting a newline.
+        """
+        if self._state is State.HOLDING and self._pending_count:
+            return self._emit_pending(Decision.DELIVER, self._pending_count,
+                                      "ime_commit", swallow=False)
+        self._burst = (0, None)
+        return self._out(Decision.PASS, False, reason="ime_commit")
 
     def _on_up(self, ev: KeyEvent) -> Outcome:
         self._down_vks.discard(ev.vk)

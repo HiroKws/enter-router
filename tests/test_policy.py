@@ -682,6 +682,35 @@ class TestIme(unittest.TestCase):
         self.assertEqual(self.h.injected(), ["shift+enter"])
         self.assertIs(self.h.machine.state, State.IDLE)
 
+    def test_a_commit_enter_is_not_a_burst_press(self):
+        """v2-h: commit, then ONE Enter = newline, TWO = send (user's config)."""
+        out = self.h.machine.on_ime_commit(
+            KeyEvent(vk=VK_RETURN, kind="down", t_ms=1000))
+        self.assertIs(out.decision, Decision.PASS)
+        self.assertFalse(out.swallow)
+        self.assertEqual(self.h.machine.pending_count, 0)
+
+        first = self.h.press(1300)                       # 1回目 = 改行
+        self.assertIs(first.decision, Decision.HOLD)
+        self.assertEqual(self.h.machine.pending_count, 1)
+        deadline = self.h.machine.on_deadline(1300 + 250)
+        self.assertEqual(deadline.resolved, "key:shift+enter")
+
+        self.h.press(2000)
+        second = self.h.press(2150)                      # 2回目 = 送信
+        self.assertIs(second.decision, Decision.HOLD)     # held once more so that
+        self.assertEqual(self.h.machine.pending_count, 2)  # a 3rd press can cancel
+        send = self.h.machine.on_deadline(2150 + 250)
+        self.assertEqual(send.resolved, "key:ctrl+enter")
+
+    def test_a_commit_after_a_held_enter_delivers_it_first(self):
+        self.h.enter(1000)                               # held single Enter
+        out = self.h.machine.on_ime_commit(
+            KeyEvent(vk=VK_RETURN, kind="down", t_ms=1100))
+        self.assertIs(out.decision, Decision.DELIVER)
+        self.assertEqual(out.resolved, "key:shift+enter")
+        self.assertFalse(out.swallow)
+
     def test_unknown_ime_state_fails_open(self):
         out = self.h.enter(1000, ime=ImeState(composing=None))
         self.assertIs(out.decision, Decision.PASS)

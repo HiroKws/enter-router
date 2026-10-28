@@ -67,6 +67,26 @@ for _d in range(10):
     NAME_BY_VK[0x30 + _d] = str(_d)
 
 
+# Keys that can put a character into an IME composition. Used only to decide
+# whether an Enter in かな mode is a COMMIT (text typed since the last Enter) or
+# an ordinary Enter the router may take over (v2-h). Deliberately conservative:
+# a false "no text" only costs one newline, a false "text" would swallow the
+# Enter that the IME needs.
+_TEXT_VK_RANGES = ((0x30, 0x39),      # 0-9
+                   (0x41, 0x5A),      # A-Z
+                   (0x60, 0x69),      # numpad 0-9
+                   (0x6A, 0x6F),      # numpad * + - . /
+                   (0xBA, 0xC0),      # OEM ; = , - . /
+                   (0xDB, 0xDE),      # OEM [ \ ] '
+                   (0xE2, 0xE2))      # OEM 102
+_TEXT_VKS = frozenset({0x20, 0x19, 0x15, 0x1C, 0x1D})   # space, 漢字, かな, 変換, 無変換
+
+
+def is_text_vk(vk: int) -> bool:
+    """True for a key that can open/extend an IME composition (v2-h)."""
+    return vk in _TEXT_VKS or any(lo <= vk <= hi for lo, hi in _TEXT_VK_RANGES)
+
+
 class KeyNameError(ValueError):
     """Unknown key name in a combo string."""
 

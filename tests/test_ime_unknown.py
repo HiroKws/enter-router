@@ -40,32 +40,41 @@ class ReporterTest(unittest.TestCase):
         self.reporter = ImeUnknownReporter(notify=notify, clock=self.clock)
 
     # -- once-only notification ------------------------------------------
-    def test_first_unknown_notifies_once(self):
+    def test_first_unknown_notifies_once_when_the_enter_is_still_converted(self):
+        """policy=process is the risky one: the user must be told about it."""
         with self.assertLogs(LOGGER, level="WARNING") as logs:
-            self.assertTrue(self.reporter.report("pass", detail="ImmGetContext=0 err=5"))
+            self.assertTrue(self.reporter.report("process", detail="ImmGetContext=0 err=5"))
         self.assertEqual(len(self.notifications), 1)
         title, body, level = self.notifications[0]
         self.assertEqual(title, NOTIFY_TITLE)
-        self.assertIn("pass", body)
+        self.assertIn("process", body)
         self.assertEqual(level, "warning")
+        self.assertTrue(any("ime_state=unknown action=process" in line
+                            for line in logs.output))
+
+    def test_the_safe_policy_is_logged_but_never_announced(self):
+        """policy=pass (default) makes unknown normal — a toast would be noise."""
+        with self.assertLogs(LOGGER, level="WARNING") as logs:
+            self.assertFalse(self.reporter.report("pass"))
+        self.assertEqual(self.notifications, [])
         self.assertTrue(any("ime_state=unknown action=pass" in line
                             for line in logs.output))
 
     def test_second_and_third_unknown_do_not_notify_again(self):
-        self.reporter.report("pass")
+        self.reporter.report("process")
         self.clock.advance_ms(5_000)
-        self.assertFalse(self.reporter.report("pass"))
+        self.assertFalse(self.reporter.report("process"))
         self.clock.advance_ms(5_000)
-        self.assertFalse(self.reporter.report("pass"))
+        self.assertFalse(self.reporter.report("process"))
         self.assertEqual(len(self.notifications), 1)
         self.assertEqual(self.reporter.occurrences, 3)
 
     def test_notification_fires_even_when_the_log_is_suppressed(self):
         """The user is told once; suppression only trims the LOG, not the notice."""
-        self.reporter.report("pass")               # logs + notifies
+        self.reporter.report("process")            # logs + notifies
         self.clock.advance_ms(100)                 # inside the log interval
         with self.assertNoLogs(LOGGER, level="WARNING"):
-            notified = self.reporter.report("pass")
+            notified = self.reporter.report("process")
         self.assertFalse(notified)
 
     # -- log contract ------------------------------------------------------
@@ -98,20 +107,20 @@ class ReporterTest(unittest.TestCase):
             raise RuntimeError("tray exploded")
 
         reporter = ImeUnknownReporter(notify=boom, clock=self.clock)
-        self.assertTrue(reporter.report("pass"))    # still reported as notified
+        self.assertTrue(reporter.report("process"))    # still reported as notified
 
     def test_without_a_notifier_it_still_logs(self):
         reporter = ImeUnknownReporter(clock=self.clock)
         with self.assertLogs(LOGGER, level="WARNING"):
-            self.assertTrue(reporter.report("pass"))
+            self.assertTrue(reporter.report("process"))
         self.assertTrue(reporter.notified)
 
     def test_reset_allows_one_more_notification(self):
-        self.reporter.report("pass")
+        self.reporter.report("process")
         self.reporter.reset()
         self.assertEqual(self.reporter.occurrences, 0)
         self.assertFalse(self.reporter.notified)
-        self.assertTrue(self.reporter.report("pass"))
+        self.assertTrue(self.reporter.report("process"))
         self.assertEqual(len(self.notifications), 2)
 
     def test_body_mentions_the_configured_behaviour(self):

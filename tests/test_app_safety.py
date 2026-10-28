@@ -116,8 +116,12 @@ class AppSafetyTest(unittest.TestCase):
         self.assertEqual(self.app._machine.state, State.PANIC)
 
     # -- unknown IME state is never silent (card t_dd246e5a) --------------
-    def test_unknown_ime_state_is_logged_and_notified_once(self):
-        """policy "pass" still passes the Enter, but the user and the log are told."""
+    def test_unknown_ime_state_is_logged_but_not_announced_under_pass(self):
+        """policy "pass": the Enter goes to the IME and the log says why.
+
+        No toast: with the default policy an unreadable state is normal while
+        typing Japanese, and a notification per typing session is noise.
+        """
         from enter_router.app.ime_unknown import ImeUnknownReporter
         from enter_router.core.events import ImeState
         from enter_router.platform import ime as ime_mod
@@ -134,8 +138,7 @@ class AppSafetyTest(unittest.TestCase):
             self.app._decide(KeyEvent(vk=VK_RETURN, kind="up", t_ms=2010))
         self.assertFalse(first)                  # passed through (policy "pass")
         self.assertFalse(second)
-        self.assertEqual(len(notes), 1)          # ONCE, not per keystroke
-        self.assertIn("IME", notes[0][0])
+        self.assertEqual(notes, [])              # no notification under "pass"
         self.assertTrue(any("ime_state=unknown action=pass" in line
                             for line in logs.output))
         self.assertTrue(any("ImmGetContext=0 err=5" in line for line in logs.output))
@@ -418,6 +421,19 @@ class AppSafetyTest(unittest.TestCase):
         self.app._on_deadline()          # the 3rd press fires on its window
         self.assertIsNot(self.app._machine.state, State.BUSY)
         self.assertIn("busy recovered", self.app.get_status().last_error)
+
+    def test_the_watchdog_is_stopped_when_the_hook_exits(self):
+        """A panic unhooks: the stale-heartbeat trip must not fire afterwards."""
+        import threading as _t
+        event = _t.Event()
+
+        class FakeWatchdog:
+            stop_event = event
+
+        self.app._watchdog_thread = FakeWatchdog()      # type: ignore[assignment]
+        self.app._on_hook_exit()
+        self.assertTrue(event.is_set())                # the loop is told to stop
+        self.assertIsNone(self.app._watchdog_thread)   # and forgotten
 
     # -- watchdog (review round 1, item 6) ---------------------------------
     def test_watchdog_trip_does_not_block_on_a_held_lock(self):

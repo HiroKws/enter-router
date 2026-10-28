@@ -106,6 +106,16 @@ WM_USER = 0x0400
 # process. Measured on Win11 + MS-IME: the composition window set appears only
 # while a composition is alive, and the UI window stays for the thread's life.
 COMPOSITION_CLASS = "MSCTFIME Composition"
+
+# WM_IME_CONTROL / IMC_*: the DEFAULT IME WINDOW answers these cross-process
+# (measured: SendMessageTimeoutW(hwnd "IME", WM_IME_CONTROL, IMC_GETOPENSTATUS)
+# -> 1 and IMC_GETCONVERSIONMODE -> 9 = NATIVE|FULLSHAPE while typing Japanese).
+WM_IME_CONTROL = 0x0283
+IMC_GETCONVERSIONMODE = 0x0001
+IMC_GETOPENSTATUS = 0x0005
+IME_CMODE_NATIVE = 0x0001          # かな入力 (a Japanese composition can exist)
+SMTO_ABORTIFHUNG = 0x0002
+IME_MODE_TIMEOUT_MS = 40
 IME_UI_CLASS = "MSCTFIME UI"
 MAX_CLASSES_IN_DETAIL = 6
 
@@ -152,6 +162,10 @@ def _init_win32() -> None:
     proto("user32", "GetClassNameW", ctypes.c_int,
           (HWND, win32lib.LPWSTR, ctypes.c_int))
     proto("user32", "IsWindow", BOOL, (HWND,))
+    proto("user32", "EnumWindows", BOOL, (ctypes.c_void_p, win32lib.LPARAM))
+    proto("user32", "SendMessageTimeoutW", win32lib.LRESULT,
+          (HWND, UINT, win32lib.WPARAM, ctypes.c_void_p, UINT, UINT,
+           ctypes.POINTER(win32lib.ULONG_PTR)))
 
 
 def ensure_message_queue() -> bool:
@@ -216,6 +230,28 @@ def _gui_thread_info(tid: int) -> dict[str, int]:
     except BaseException:
         log.debug("GetGUIThreadInfo failed", exc_info=True)
     return out
+
+
+def _window_pid(hwnd: int) -> int:
+    """Process id that owns ``hwnd`` (0 when unreadable)."""
+    if not hwnd:
+        return 0
+    try:
+        pid = win32lib.DWORD(0)
+        win32lib.dll("user32").GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except BaseException:
+        return 0
+
+
+def _default_ime_wnd(hwnd: int) -> int:
+    """The window that answers WM_IME_CONTROL for ``hwnd`` (0 when none)."""
+    if not hwnd:
+        return 0
+    try:
+        return int(win32lib.dll("imm32").ImmGetDefaultIMEWnd(hwnd) or 0)
+    except BaseException:
+        return 0
 
 
 def _class_of(hwnd: int) -> str:
@@ -283,6 +319,109 @@ def _tsf_scan(tids: tuple[int, ...]) -> tuple[str | None, str]:
     if anchors:
         return "not_composing", detail
     return None, detail
+
+
+def classify_composition(tsf_thread: str | None,
+                         process_classes: tuple[str, ...] | list[str],
+                         mode: tuple[bool, int] | None) -> tuple[str | None, str]:
+    """Decide composing / not_composing / unknown from the cheap observations.
+
+    Pure (no Win32), so the rule is unit-tested on Linux. The rule exists because
+    a WRONG "not_composing" breaks Japanese input: the Enter is then swallowed and
+    replaced by a synthesized key, so the IME never commits (measured on hardware:
+    every Enter became ``key:shift+enter`` while typing Japanese).
+
+    Order of evidence (strongest first):
+
+    1. ``tsf_thread == "composing"`` (window on the foreground thread) -> composing
+    2. a ``MSCTFIME Composition`` window anywhere in the target PROCESS  -> composing
+       (a Chromium/Electron app composes in a renderer thread, not on the UI
+       thread, which is exactly the case that used to read as "not composing")
+    3. the IME window says open + NATIVE (かな) mode               -> UNKNOWN:
+       an unobservable composition may exist, so never claim "not composing";
+       ``ime_unknown_policy: "pass"`` (default) then lets Enter commit.
+    4. the IME window says open but NOT native (英数)              -> not_composing
+       (no Japanese composition can exist in alphanumeric mode)
+    5. anything else                                              -> unknown
+
+    "not_composing" therefore ALWAYS needs the IME window's answer: the
+    ``MSCTFIME UI`` anchor alone is not evidence that no composition exists (that
+    inference is what broke Japanese input). Unknown is the safe answer — the
+    default ``ime_unknown_policy: "pass"`` hands the Enter to the IME.
+    """
+    if tsf_thread == "composing":
+        return "composing", "tsf_thread"
+    if COMPOSITION_CLASS in process_classes:
+        return "composing", "tsf_process"
+    if mode is not None:
+        opened, conversion = mode
+        if opened and (conversion & IME_CMODE_NATIVE):
+            return None, f"ime_native_unobservable(open=1 conv=0x{conversion:X})"
+        if opened:
+            return "not_composing", f"ime_alnum(conv=0x{conversion:X})"
+        return "not_composing", "ime_closed"
+    return None, "no-evidence"
+
+
+def ime_mode(ime_wnd: int) -> tuple[bool, int] | None:
+    """``(open, conversion mode)`` of the default IME window, or None.
+
+    Measured to answer for ANOTHER process's window (WM_IME_CONTROL), unlike
+    ``ImmGetContext``. Bounded by a short timeout so a hung app cannot stall the
+    hook thread.
+    """
+    if not ime_wnd:
+        return None
+    try:
+        user32 = win32lib.dll("user32")
+        result = win32lib.ULONG_PTR(0)
+
+        def ask(what: int) -> int | None:
+            ok = user32.SendMessageTimeoutW(
+                ime_wnd, WM_IME_CONTROL, win32lib.WPARAM(what), None,
+                SMTO_ABORTIFHUNG, IME_MODE_TIMEOUT_MS, ctypes.byref(result))
+            return int(result.value) if ok else None
+
+        opened = ask(IMC_GETOPENSTATUS)
+        if opened is None:
+            return None
+        conversion = ask(IMC_GETCONVERSIONMODE)
+        if conversion is None:
+            return None
+        return bool(opened), conversion
+    except BaseException:
+        log.debug("ime_mode failed", exc_info=True)
+        return None
+
+
+def _process_windows(pid: int) -> tuple[str, ...]:
+    """Class names of every top-level window owned by ``pid``.
+
+    ``EnumThreadWindows`` only sees the foreground thread; a Chromium/Electron
+    app keeps its composition on a renderer thread, so the process-wide scan is
+    what finds it. Bounded: only called when the thread scan said "not
+    composing" and the IME mode did not already decide.
+    """
+    if not pid:
+        return ()
+    found: list[str] = []
+
+    def _collect(hwnd, _lparam):
+        try:
+            owner = win32lib.DWORD(0)
+            win32lib.dll("user32").GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if int(owner.value) == pid:
+                found.append(_class_of(hwnd))
+        except BaseException:
+            pass
+        return True
+
+    try:
+        win32lib.dll("user32").EnumWindows(_WNDENUMPROC(_collect), win32lib.LPARAM(0))
+    except BaseException:
+        log.debug("EnumWindows failed", exc_info=True)
+        return ()
+    return tuple(found)
 
 
 def _read_context(hwnd: int) -> tuple[str | None, str]:
@@ -355,6 +494,7 @@ class CompositionProbe:
             self._imm_dead = False
             self._winner = ""
             self._failed_at = None
+            self._fail_source = ""
             self._last_detail = ""
 
     def _discover(self, hwnd: int) -> None:
@@ -362,6 +502,7 @@ class CompositionProbe:
         self._hwnd = hwnd
         self._winner = ""
         self._failed_at = None
+        self._fail_source = ""
         self._last_detail = ""
         self._imm_dead = False
         tid = _window_thread(hwnd)
@@ -428,7 +569,13 @@ class CompositionProbe:
             now = self._clock()
             if (self._failed_at is not None
                     and (now - self._failed_at) * 1000.0 < self._unknown_retry_ms):
-                return ImeState(composing=None, source="cached",
+                # The cached answer keeps its PROVENANCE: "ime_native" means
+                # "かな mode, composition invisible", which the app layer must
+                # still be able to recognise during the retry window. Losing it
+                # made every Enter in those 2s an unclassified unknown => pass
+                # (measured: a single Enter sent the message).
+                return ImeState(composing=None,
+                                source=(self._fail_source or "cached"),
                                 detail="cached-unknown; " + self._last_detail)
             if self._failed_at is not None:
                 # The unknown retry window has just expired: retry the FULL route
@@ -436,6 +583,31 @@ class CompositionProbe:
                 # permanent just because the fast path was taken earlier.
                 self._imm_dead = False
             notes: list[str] = []
+            # Cheap first: the IME window's mode. It answers cross-process in ~0.1ms
+            # while the IMM route costs four attach attempts (measured 46ms on the
+            # first Enter of a window, over the 5ms callback budget).
+            mode = ime_mode(_default_ime_wnd(self._hwnd))
+            japanese = bool(mode and mode[0] and (mode[1] & IME_CMODE_NATIVE))
+            notes.append(f"ime_mode={mode}")
+            if japanese:
+                # かな入力中: the precise route cannot see another process's
+                # composition anyway, so only the (cheap, positive-only) TSF scan
+                # is worth running. No composition window => unknown, which the
+                # default policy hands to the IME (the commit must work).
+                tsf_state, tsf_note = _tsf_scan(self._tsf_targets())
+                notes.append(tsf_note)
+                if tsf_state == "composing":
+                    self._winner = "tsf_composition"
+                    self._failed_at = None
+                    self._last_detail = "; ".join(notes)
+                    return ImeState(composing=True, source="tsf_composition",
+                                    detail=self._last_detail)
+                notes.append("ime_native_unobservable(open=1 native)")
+                self._failed_at = now
+                self._fail_source = "ime_native"
+                self._last_detail = "; ".join(notes)
+                return ImeState(composing=None, source="ime_native",
+                                detail=self._last_detail)
             if self._imm_dead:
                 notes.append("imm=skipped (no readable context for this window)")
             else:
@@ -456,16 +628,35 @@ class CompositionProbe:
                 self._imm_dead = True
             tsf_state, tsf_note = _tsf_scan(self._tsf_targets())
             notes.append(tsf_note)
-            if tsf_state is not None:
+            if tsf_state == "composing":
                 self._failed_at = None
                 self._last_detail = "; ".join(notes)
-                return ImeState(composing=(tsf_state == "composing"),
-                                source=("tsf_composition" if tsf_state == "composing"
-                                        else "tsf_ime_ui"),
+                return ImeState(composing=True, source="tsf_composition",
+                                detail=self._last_detail)
+            # No positive evidence yet. Two more observations decide it:
+            #  (a) the IME window's open/conversion mode (WM_IME_CONTROL answers
+            #      cross-process, unlike ImmGetContext), and
+            #  (b) only when (a) is unreadable, a PROCESS-wide window scan — a
+            #      Chromium/Electron app composes on a renderer thread, so the
+            #      thread-only scan legitimately finds nothing.
+            notes.append(f"ime_mode={mode}")
+            process_classes: tuple[str, ...] = ()
+            if mode is None:
+                process_classes = _process_windows(_window_pid(self._hwnd))
+                notes.append(f"process_windows={len(process_classes)}")
+            verdict, why = classify_composition(tsf_state, process_classes, mode)
+            notes.append(why)
+            self._last_detail = "; ".join(notes)
+            if verdict is not None:
+                self._failed_at = None
+                return ImeState(composing=(verdict == "composing"),
+                                source=("ime_native" if why.startswith("ime_native")
+                                        else why.split("(")[0]),
                                 detail=self._last_detail)
             self._failed_at = now
-            self._last_detail = "; ".join(notes) or "no-candidate"
-            return ImeState(composing=None, detail=self._last_detail)
+            self._fail_source = "unknown"
+            return ImeState(composing=None, source="unknown",
+                            detail=self._last_detail)
 
 
 _probe = CompositionProbe()
