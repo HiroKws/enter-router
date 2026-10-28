@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "global": {
+    "operations": {
+      "enter": "newline",
+      "enter2": "send",
+      "enter3": "hermes",
+      "shift+enter": "newline",
+      "ctrl+enter": "send",
+      "alt+enter": "pass",
+      "f1": "none",
+      "f2": "none",
+      "f3": "none",
+      "f4": "none",
+      "f5": "none",
+      "f6": "none",
+      "f7": "none",
+      "f8": "none",
+      "f9": "none",
+      "f10": "none",
+      "f11": "none",
+      "f12": "none"
+    }
+  },
+  "policy": {
+    "enabled": true,
+    "hold_mode": "deterministic",
+    "hold_window_ms": 250,
+    "triple_enter_window_ms": 250,
+    "chatter_debounce_ms": 15,
+    "trigger_cooldown_ms": 500,
+    "panic_key": "f1",
+    "panic_repeat": 3
+  },
+  "registration": {
+    "process_key": "alt+f5",
+    "process_title_key": "alt+f6"
+  },
+  "safety": {
+    "callback_budget_warn_ms": 5,
+    "callback_overbudget_ms": 50,
+    "callback_overbudget_streak": 5,
+    "callback_hard_limit_ms": 250,
+    "watchdog_interval_ms": 1000,
+    "watchdog_stale_ms": 3000
+  },
+  "capture": {
+    "chain": [
+      "uia_focused",
+      "clipboard_select_copy"
+    ],
+    "clipboard_restore": true,
+    "preview_chars": 60
+  },
+  "sinks": {
+    "clipboard": {
+      "type": "clipboard",
+      "enabled": true
+    },
+    "ai_chat": {
+      "type": "ai_chat",
+      "enabled": true,
+      "method": "paste",
+      "send_after_insert": false
+    },
+    "hermes": {
+      "type": "hermes",
+      "enabled": true,
+      "wsl_distro": "",
+      "shell": "/bin/bash",
+      "timeout_sec": 30,
+      "profile": null,
+      "query_file_stdin": false
+    }
+  },
+  "profiles": [
+    {
+      "id": "notepad",
+      "enabled": true,
+      "match": {
+        "process": "Notepad.exe"
+      },
+      "keymap": {
+        "send": "ctrl+enter",
+        "newline": "enter"
+      }
+    }
+  ],
+  "logging": {
+    "level": "INFO",
+    "dir": null,
+    "max_bytes": 1048576,
+    "backup_count": 3
+  }
+}
