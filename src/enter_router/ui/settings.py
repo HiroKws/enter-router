@@ -86,14 +86,37 @@ class SettingsWindow:
 
         self.win = tk.Toplevel(master)
         self.win.title(WINDOW_TITLE)
-        self.win.geometry("960x760")
-        self.win.minsize(820, 620)
+        # No hardcoded geometry: the height comes from what the tabs need
+        # (see _fit_to_content). A fixed 760px clipped the footer — 保存
+        # disappeared — as soon as tab A's content grew past it.
+        self.win.withdraw()
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
         self._build()
+        self._fit_to_content()
         self._reload_all()
         # The IME guarantee is checked, not just intended (raises on violation).
         ime_guard.assert_no_enter_submit(self.win)
+        self.win.deiconify()
+
+    def _fit_to_content(self) -> None:
+        """Size the window to its content, clamped to the screen.
+
+        Tk's packer gives the space to whoever was packed FIRST and clips the
+        last: with a fixed 760px window, the footer (保存/キャンセル) lost the
+        fight against the notebook and was drawn 1px tall. The height therefore
+        follows the requested height, never a constant, and the screen is the
+        only upper bound.
+        """
+        self.win.update_idletasks()
+        width = max(960, self.win.winfo_reqwidth())
+        height = max(620, self.win.winfo_reqheight())
+        screen_w = self.win.winfo_screenwidth()
+        screen_h = self.win.winfo_screenheight()
+        width = min(width, max(640, screen_w - 80))
+        height = min(height, max(560, screen_h - 140))
+        self.win.geometry(f"{width}x{height}")
+        self.win.minsize(min(820, width), min(560, height))
 
     # ------------------------------------------------------------------
     # construction
@@ -105,7 +128,7 @@ class SettingsWindow:
         style.configure("Big.TLabel", font=("Yu Gothic UI", 12, "bold"))
 
         header = ttk.Frame(self.win, padding=(10, 8))
-        header.pack(fill="x")
+        header.pack(side="top", fill="x")
         self.state_chip = tk.Label(header, text="有効", fg="white", bg="#1f7a1f",
                                    font=("Yu Gothic UI", 12, "bold"), padx=12, pady=4)
         self.state_chip.pack(side="left")
@@ -118,22 +141,19 @@ class SettingsWindow:
         self.toggle_button.pack(side="right")
 
         self.path_label = ttk.Label(self.win, text="設定ファイル: -", padding=(10, 0))
-        self.path_label.pack(fill="x")
+        self.path_label.pack(side="top", fill="x")
 
-        self.notebook = ttk.Notebook(self.win)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=(6, 4))
-        self.tab_a = ttk.Frame(self.notebook, padding=8)
-        self.tab_b = ttk.Frame(self.notebook, padding=8)
-        self.tab_c = ttk.Frame(self.notebook, padding=8)
-        self.notebook.add(self.tab_a, text="操作マップ")
-        self.notebook.add(self.tab_b, text="プロファイル")
-        self.notebook.add(self.tab_c, text="テスト送信")
-        self._build_tab_a()
-        self._build_tab_b()
-        self._build_tab_c()
+        # Bottom bars first, with side="bottom": Tk's packer hands out space in
+        # packing order and clips whatever is packed LAST. The notebook (the
+        # biggest requester, and the only thing that can usefully shrink) must
+        # therefore be packed last — otherwise the footer collapses to 1px and
+        # 保存 / キャンセル disappear on a window shorter than the content.
+        self.issues_text = tk.Text(self.win, height=3, wrap="word", state="disabled",
+                                   bg="#fff8f8")
+        self.issues_text.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
 
         footer = ttk.Frame(self.win, padding=(10, 6))
-        footer.pack(fill="x")
+        footer.pack(side="bottom", fill="x")
         self.save_button = ttk.Button(footer, text="保存", command=self.save)
         self.save_button.pack(side="right")
         self.cancel_button = ttk.Button(footer, text="キャンセル（変更を破棄）",
@@ -144,9 +164,17 @@ class SettingsWindow:
         self.message_label = ttk.Label(footer, text="", wraplength=560, justify="left")
         self.message_label.pack(side="left", fill="x", expand=True)
 
-        self.issues_text = tk.Text(self.win, height=3, wrap="word", state="disabled",
-                                   bg="#fff8f8")
-        self.issues_text.pack(fill="x", padx=10, pady=(0, 8))
+        self.notebook = ttk.Notebook(self.win)
+        self.notebook.pack(side="top", fill="both", expand=True, padx=10, pady=(6, 4))
+        self.tab_a = ttk.Frame(self.notebook, padding=8)
+        self.tab_b = ttk.Frame(self.notebook, padding=8)
+        self.tab_c = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(self.tab_a, text="操作マップ")
+        self.notebook.add(self.tab_b, text="プロファイル")
+        self.notebook.add(self.tab_c, text="テスト送信")
+        self._build_tab_a()
+        self._build_tab_b()
+        self._build_tab_c()
 
     # -- tab A ---------------------------------------------------------
     def _build_tab_a(self) -> None:

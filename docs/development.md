@@ -251,6 +251,28 @@ Enter ×1 だけを押したときは `op=enter meaning=newline … resolved=key
   （`FindWindowW` + `WM_APP` メッセージ）。**パニック停止**はトレイメニュー先頭と設定画面ヘッダの
   ボタンの 2 か所にあり、どちらも 1 クリックです。
 
+### 設定画面のレイアウト（クリップされない要件）
+
+設定画面は**高さを固定しない**。内容の要求高さ（タブ A だけで 759px）が現在 951px あり、
+`geometry("960x760")` のような固定値だと Tk の pack が**最後に pack したウィジェットから
+潰す**ため、footer の **保存／キャンセル（変更を破棄）／設定を読み直す** が 1px になって
+消えます（実測: `save button mapped=0`, footer=1px）。この現象は 2026-10-28 に実際に起きた。
+
+守るべき 2 点:
+
+- **下段（footer と警告欄）を `side="bottom"` で先に pack し、notebook を最後に pack**する。
+  潰れてよいのは伸縮できる notebook だけで、ボタンは絶対に潰さない。
+- 高さは `_fit_to_content()` が要求高さから算出し、画面の作業領域を上限にする
+  （`min(req, screen_h - 140)`）。`minsize` もその値から決める。
+
+確認コマンド（実 Tk で要求高さ・footer・保存ボタンの mapped を測る）:
+
+```powershell
+C:\Python314\python.exe -X utf8 <repo>\scripts\win_settings_layout.py
+#   正常: window geometry now : 960x951 / footer actual : 960x37 / save button mapped : 1
+#   異常: save button mapped : 0 / footer actual : 1x1
+```
+
 ### UI の実機チェック（Windows）
 
 ```powershell
