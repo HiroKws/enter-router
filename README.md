@@ -125,6 +125,11 @@ Enter 1 回＝改行／2 回＝送信／3 回＝AI（Hermes）へ／4 回以上�
 
 `%APPDATA%\enter-router\config.json`（JSON。直接編集しても、保存すれば自動で反映されます）。
 
+初回起動時に作られる設定ファイルは **プロファイルが空**です（＝未登録なので全アプリ素通し。
+登録キーでアプリを足すのがオプトイン）。`site-a` / `site-b` / `excel` のような**サンプルは
+同梱の [`config/sample.config.json`](config/sample.config.json) と docs/design.md §4.2 にだけ
+入っています** — 実運用の設定に混ざることも、作り直しで復活することもありません。
+
 **どのアプリでも動かしたい**場合は、同梱の
 [`config/chat-default.config.json`](config/chat-default.config.json) を
 `%APPDATA%\enter-router\config.json` にコピーしてください（全アプリが対象になります）。

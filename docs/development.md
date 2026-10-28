@@ -251,6 +251,16 @@ Enter ×1 だけを押したときは `op=enter meaning=newline … resolved=key
   （`FindWindowW` + `WM_APP` メッセージ）。**パニック停止**はトレイメニュー先頭と設定画面ヘッダの
   ボタンの 2 か所にあり、どちらも 1 クリックです。
 
+### 設定ファイルの書き込み規則（削除したプロファイルを復活させない）
+
+- **初回生成**（ファイルが無いとき）は `first_run_config_dict()` を使う。`profiles` は**空**。
+  サンプル（site-a / site-b / excel）は `config/sample.config.json` と design §4.2 にだけ置く。
+- **書き込みは常に「ディスクの現在の内容」を起点にする**。登録キー（Alt+F2/F3）は
+  `_config_dict_from_disk()` で読み直してから追記し、読めないときだけメモリの写しに落ちる。
+  メモリの古い写しを丸ごと書き戻すと、設定画面で消したプロファイルが次の書き込みで復活する
+  （実機で起きた。`tests/test_registration.py::test_registration_does_not_resurrect_a_deleted_profile`）。
+- `profiles` が無い／空の設定は**合法**（全アプリ素通し）。欠落時にサンプルへフォールバックしない。
+
 ### 設定画面のレイアウト（クリップされない要件）
 
 設定画面は**高さを固定しない**。内容の要求高さ（タブ A だけで 759px）が現在 951px あり、

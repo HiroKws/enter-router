@@ -166,6 +166,26 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(len(self._doc()["profiles"]), 3)
         self.assertTrue(any("登録できませんでした" in body for _t, body, _l in self.notes))
 
+    def test_registration_does_not_resurrect_a_deleted_profile(self):
+        """The write starts from the FILE, never from this process's snapshot.
+
+        Reported on hardware: profiles deleted in the settings window came back
+        the next time anything wrote the config — a registration hotkey rewrote
+        the whole document from a stale in-memory copy. Only the file on disk is
+        allowed to be the base document.
+        """
+        doc = self._doc()
+        doc["profiles"] = [p for p in doc["profiles"] if p["id"] != "excel"]
+        self.path.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        # this process still holds the old document (excel included)
+        self.assertEqual([p.id for p in self.cfg.profiles], ["site-a", "site-b", "excel"])
+
+        self._press(VK_F5)
+
+        ids = [p["id"] for p in self._doc()["profiles"]]
+        self.assertEqual(ids, ["site-a", "site-b", "firefox"])   # excel stays deleted
+
 
 if __name__ == "__main__":
     unittest.main()

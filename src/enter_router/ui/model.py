@@ -427,8 +427,9 @@ class SettingsModel:
         return index + 1
 
     def delete_profile(self, index: int) -> bool:
-        if len(self._data["profiles"]) <= 1:
-            return False                # core requires at least one profile
+        # An empty profile list is legal (core: no profile = every app passes
+        # through). Refusing the last deletion would leave a profile the user
+        # cannot remove — exactly the "why is this sample still here" complaint.
         del self._data["profiles"][index]
         return True
 

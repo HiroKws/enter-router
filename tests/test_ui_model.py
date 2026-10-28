@@ -117,9 +117,10 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertTrue(model.delete_profile(dup))
         self.assertEqual(len(model.profiles()), start + 1)
-        while len(model.profiles()) > 1:
+        while model.profiles():
             self.assertTrue(model.delete_profile(0))
-        self.assertFalse(model.delete_profile(0))             # last one stays
+        self.assertEqual(model.profiles(), [])                # empty is legal now
+        self.assertEqual(parse_config(model.to_dict()).profiles, ())   # and saves
 
     def test_duplicate_ids_are_rejected_by_core(self):
         model = fresh_model()

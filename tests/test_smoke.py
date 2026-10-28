@@ -139,6 +139,25 @@ class TestSampleConfig(unittest.TestCase):
         self.assertEqual(cfg.operations, config.DEFAULT_CONFIG.operations)
         self.assertEqual(cfg.profiles, config.DEFAULT_CONFIG.profiles)
 
+    def test_first_run_config_carries_no_sample_profiles(self):
+        """"修正のたびにサンプルのプロファイルが復活する" を防ぐ。
+
+        The example rules are documentation (config/sample.config.json, design
+        §4.2); a live config must start with none of them, or the user deletes
+        site-a/site-b/excel on day one and every regeneration brings them back.
+        """
+        doc = config.first_run_config_dict()
+        self.assertEqual(doc["profiles"], [])
+        cfg = parse_config(doc)
+        self.assertEqual(cfg.profiles, ())
+        self.assertEqual(cfg.warnings, ())
+        self.assertEqual(cfg.operations, config.DEFAULT_CONFIG.operations)
+
+    def test_missing_or_empty_profiles_means_pass_through(self):
+        """No profile list = every app passes through; never fall back to samples."""
+        self.assertEqual(parse_config({"schema_version": 1}).profiles, ())
+        self.assertEqual(parse_config({"schema_version": 1, "profiles": []}).profiles, ())
+
     def test_default_operations_constant_is_the_design_map(self):
         self.assertEqual(config.DEFAULT_OPERATIONS, SAMPLE_OPERATIONS)
         self.assertEqual(config.DEFAULT_CONFIG.operations, SAMPLE_OPERATIONS)

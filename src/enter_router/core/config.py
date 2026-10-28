@@ -548,13 +548,18 @@ def parse_config(raw: dict[str, Any]) -> Config:
 
     profs_raw = raw.get("profiles")
     if profs_raw is None:
-        profiles: tuple[Profile, ...] = DEFAULT_PROFILES
+        # No profiles section = "every app passes through". This must NOT fall
+        # back to the sample profiles: a live config that loses the section (or
+        # a first-run file) would come back carrying dead example rules the user
+        # has already deleted once (design §4.4: creating a profile IS the opt-in).
+        profiles: tuple[Profile, ...] = ()
     else:
         _require(isinstance(profs_raw, list), "profiles must be a list")
         profiles = tuple(_parse_profile(p, i, warnings) for i, p in enumerate(profs_raw))
         ids = [p.id for p in profiles]
         _require(len(ids) == len(set(ids)), "profile ids must be unique")
-        _require(len(profiles) > 0, "profiles must contain at least one profile")
+        # An empty list is legal: no profile means every app passes through, which
+        # is the safe default and what a freshly created config starts with.
 
     # A catch-all profile makes EVERY app "defined", which defeats the
     # "unmatched app passes through" safety rule (design §4.3) — warn, don't reject.
@@ -594,6 +599,22 @@ def parse_config_text(text: str) -> Config:
     except json.JSONDecodeError as e:
         raise ConfigError(f"invalid JSON: {e}") from e
     return parse_config(raw)
+
+
+def first_run_config_dict() -> dict[str, Any]:
+    """The document written when no config file exists yet: defaults minus samples.
+
+    The example rules (``site-a`` / ``site-b`` / ``excel``) belong to the shipped
+    ``config/sample.config.json`` and to docs/design.md §4.2 — they are
+    documentation, not a user's rules. A live config that starts with them makes
+    the user delete three dead profiles on day one, and every regeneration of the
+    file brings them back. So the first-run file carries **no profiles**: an app
+    without a profile passes every operation through, and registering an app
+    (Alt+F2 / Alt+F3) is the opt-in (design §4.4).
+    """
+    doc = default_config_dict()
+    doc["profiles"] = []
+    return doc
 
 
 def default_config_dict() -> dict[str, Any]:

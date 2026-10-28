@@ -39,7 +39,8 @@ from enter_router.app.sink_runner import SinkJob, SinkWorker
 from enter_router.core import keys as keys_mod
 from enter_router.core import routing
 from enter_router.core.config import (Config, ConfigError, default_config_dict,
-                                      parse_config, parse_config_text)
+                                      first_run_config_dict, parse_config,
+                                      parse_config_text)
 from enter_router.core.events import VK_RETURN, ImeState, KeyEvent
 from enter_router.core.policy import (Decision, EnterPolicyMachine, Outcome,
                                       State)
@@ -76,12 +77,13 @@ def load_config(path: str | None) -> tuple[Config, str]:
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "w", encoding="utf-8") as handle:
-                json.dump(default_config_dict(), handle, ensure_ascii=False, indent=2)
+                json.dump(first_run_config_dict(), handle, ensure_ascii=False, indent=2)
                 handle.write("\n")
-            log.info("created default config at %s", target)
+            log.info("created config at %s (no profiles: register an app with the "
+                     "registration key to opt in)", target)
         except OSError as e:
             log.error("could not create %s (%s) — using built-in defaults", target, e)
-            return parse_config(default_config_dict()), target
+            return parse_config(first_run_config_dict()), target
     with open(target, encoding="utf-8") as handle:
         return parse_config_text(handle.read()), target
 
@@ -382,7 +384,7 @@ class EnterRouterApp:
                              "warning")
                 return
 
-            doc = self.get_config_dict()
+            doc = self._config_dict_from_disk() or self.get_config_dict()
             profiles = doc.setdefault("profiles", [])
             wanted_title = routing.literal_glob(title) if title else None
             for existing in profiles:
@@ -761,6 +763,23 @@ class EnterRouterApp:
         self._last_error = f"config: {message}"
         self._notify("enter-router", f"設定が不正のため旧設定を継続します: {message}",
                      "warning")
+
+    def _config_dict_from_disk(self) -> dict | None:
+        """The config file as it is NOW (dict), or None when it cannot be read.
+
+        Registration writes the WHOLE document, so it must start from the file on
+        disk and not from this process's snapshot: a profile the user deleted in
+        the settings window (or in another instance) must not come back because a
+        stale copy was still in memory.
+        """
+        try:
+            with open(self._config_path, encoding="utf-8") as handle:
+                doc = json.load(handle)
+        except (OSError, ValueError):
+            log.debug("registration: could not read %s", self._config_path,
+                      exc_info=True)
+            return None
+        return doc if isinstance(doc, dict) else None
 
     def reload_config(self) -> tuple[bool, str]:
         try:
