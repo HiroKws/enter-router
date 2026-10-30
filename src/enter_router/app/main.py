@@ -58,6 +58,12 @@ EXIT_WATCHDOG = 70
 #: long enough that the check never competes with typing.
 SUPERVISOR_INTERVAL_S = 2.0
 
+#: Delay before the "remove the leftover newline" Backspace that follows a
+#: double-Enter send. Long enough for the application to process the send and
+#: clear the input (so the Backspace cannot eat a character of the draft), short
+#: enough that the user does not see it.
+SEND_CLEANUP_DELAY_S = 0.08
+
 
 # ---------------------------------------------------------------------------
 # small infrastructure
@@ -211,6 +217,16 @@ class EnterRouterApp:
     def _meaning(self, op: str) -> str | None:
         return routing.lookup_meaning(self._cfg, op)
 
+    def _foreground_profile_id(self) -> str:
+        """Profile id that owns the current foreground app ("" when undefined).
+
+        Logged with the IME decision so a report about "Enter stopped committing"
+        names the app instead of forcing a guess about which window it was.
+        """
+        _hwnd, fg = self._fg.snapshot()
+        profile = routing.match_profile(self._cfg, fg)
+        return profile.id if profile else ""
+
     def _make_machine(self, config: Config) -> EnterPolicyMachine:
         return EnterPolicyMachine(config.policy, self._resolve,
                                   meaning_of=self._meaning,
@@ -267,13 +283,22 @@ class EnterRouterApp:
                     # consequence. Text since the last Enter => this Enter ends a
                     # composition (a commit: hand it to the IME, never count it).
                     # No text => nothing to commit, so it is an ordinary Enter.
-                    commit = (hwnd == self._ime_text_hwnd
-                              and self._ime_text_count > 0)
+                    same_window = hwnd == self._ime_text_hwnd
+                    commit = same_window and self._ime_text_count > 0
                     if not commit:
                         ime = ImeState(composing=False, source="ime_native_idle",
                                        detail=ime.detail)
-                    log.debug("ime native commit=%s text_count=%d", commit,
-                              self._ime_text_count)
+                    # INFO on purpose (v2-l follow-up): in Chromium/Electron and
+                    # Firefox the composition is NOT readable from outside (measured:
+                    # a live か composition in an Edge window still reports
+                    # "composition=0"), so this heuristic is the only signal that
+                    # decides commit-vs-hijack. When "Enter stopped committing" is
+                    # reported, these four numbers ARE the evidence — DEBUG left
+                    # nothing to look at.
+                    log.info("ime_unobservable profile=%s commit=%d text_count=%d "
+                             "same_window=%d source=%s",
+                             self._foreground_profile_id() or "-", int(commit),
+                             self._ime_text_count, int(same_window), ime.source)
                 elif ime.composing is None:
                     # Three-valued probe, the third answer is "I could not read
                     # it". Say so (log always, notification once) — the old code
@@ -525,7 +550,13 @@ class EnterRouterApp:
             from enter_router.platform import inject
             combo = out.resolved[4:]
             sent = inject.send_combo(combo, held)
-            log.info("inject combo=%s held=%s events=%d", combo, held, sent)
+            if out.action == "send_cleanup":
+                log.info("inject cleanup combo=%s events=%d (remove the leftover newline)",
+                         combo, sent)
+            else:
+                log.info("inject combo=%s held=%s events=%d", combo, held, sent)
+            if out.action == "enter2":
+                self._schedule_send_cleanup()
             return
         if out.resolved.startswith("sink:"):
             self._enqueue_sink(out)
@@ -536,6 +567,34 @@ class EnterRouterApp:
             from enter_router.platform import inject
             sent = inject.send_enter(copies, held)
             log.info("inject enter copies=%d held=%s events=%d", copies, held, sent)
+
+    def _schedule_send_cleanup(self) -> None:
+        """Remove the newline a "send and clear" input leaves behind (v2-m).
+
+        A chat input that sends on Enter and clears the box *without*
+        ``preventDefault`` still gets the browser's own newline inserted into the
+        just-cleared box, so the next message starts one line down (measured in
+        Chromium; site-dependent in browsers). One Backspace on that empty box
+        removes it, and in an input that leaves nothing behind the same Backspace
+        is a no-op on an empty field.
+
+        Delivered late and through the queue for two separate reasons: the
+        application must first process the send and clear the box (a Backspace
+        that arrives too early would delete a character of the draft), and the
+        hook thread must never be blocked by a sleep.
+        """
+        timer = threading.Timer(SEND_CLEANUP_DELAY_S, self._enqueue_send_cleanup)
+        timer.daemon = True
+        timer.start()
+
+    def _enqueue_send_cleanup(self) -> None:
+        cleanup = Outcome(decision=Decision.DELIVER, state=State.IDLE,
+                          swallow=False, action="send_cleanup",
+                          resolved="key:backspace", count=1, reason="send_cleanup")
+        try:
+            self._dispatch_inject(cleanup)
+        except BaseException:
+            log.exception("send cleanup (backspace) could not be queued")
 
     def _enqueue_sink(self, out: Outcome) -> None:
         _hwnd, fg = self._fg.snapshot()
