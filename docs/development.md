@@ -251,6 +251,28 @@ Enter ×1 だけを押したときは `op=enter meaning=newline … resolved=key
   （`FindWindowW` + `WM_APP` メッセージ）。**パニック停止**はトレイメニュー先頭と設定画面ヘッダの
   ボタンの 2 か所にあり、どちらも 1 クリックです。
 
+### 落ちたように見えるとき（v2-l: 自動復旧と事後診断）
+
+「時々勝手に止まり、キーが素通りし、トレイのアイコンも消える」という報告に対する対策。
+原因は 1 つではなく、**どれも「止まったことが記録に残らない」**のが共通の欠点だったので、
+記録と復旧の両方を足しています（`app/supervisor.py` / `ui/tray.py` / `app/logsetup.py`）。
+
+| 起きること | 以前 | いま |
+|---|---|---|
+| フックのスレッドが自走で終了（意図しない `WM_QUIT`、ループ内例外） | 状態が「一時停止」になり、**そのまま素通しで常駐し続ける**（誰も直さない） | `hook loop exited without a stop request` をログに出し、**2 秒以内に張り直す**（`hook re-installed (attempt N)`）。5 回続けて失敗したら「一時停止」に落として通知 |
+| Explorer の再起動でトレイアイコンが消える | シェルは忘れたまま。**プロセスは生きているのにアイコンが二度と戻らない** | `TaskbarCreated` を拾って `Shell_NotifyIcon` をやり直す（`tray icon re-added after an explorer restart`） |
+| 一時停止 → 再開 | 監視スレッド（無応答検知）が**再開後は動いていなかった** | フックを張り直すたびに監視スレッドも確実に起動し直す |
+| プロセスの異常終了 / 強制終了 | 何も残らない（`pythonw` には stderr が無い） | `logs/crash.log` に全スレッドのスタック（`faulthandler`）、死んだスレッドはログに `thread X died`、正常終了時は `process exiting (atexit)` |
+
+読み方:
+
+- ログの末尾が判定行のまま終わっていて `process exiting (atexit)` が無い → **プロセスが外から終了された**
+  （`os._exit(70)` / `TerminateProcess`。atexit は走らない）。シャットダウン・スリープの時刻と突き合わせる。
+- `hook loop exited without a stop request` の後に `hook re-installed` が続く → **その瞬間は素通りだった**が自動復旧済み。
+- `hook repair gave up` → 自動復旧の上限（5 回）。トレイの「再開」で戻す。
+- 一時停止（`set_enabled(False)`）とパニック（`panic state entered`）は**意図した停止**なので復旧しません
+  （`hook loop exited (reason=paused)` / `(reason=panic)`）。
+
 ### 設定ファイルの書き込み規則（削除したプロファイルを復活させない）
 
 - **初回生成**（ファイルが無いとき）は `first_run_config_dict()` を使う。`profiles` は**空**。

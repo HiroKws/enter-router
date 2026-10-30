@@ -256,6 +256,8 @@ class _API:
 
         self.Shell_NotifyIconW = proto(shell32, "Shell_NotifyIconW", wt.BOOL,
                                        [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)])
+        self.RegisterWindowMessageW = proto(user32, "RegisterWindowMessageW", wt.UINT,
+                                            [wt.LPCWSTR])
         self.GetModuleHandleW = proto(kernel32, "GetModuleHandleW", wt.HMODULE,
                                       [wt.LPCWSTR])
 
@@ -333,6 +335,10 @@ class TrayIcon:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._error = ""
+        # "TaskbarCreated": Explorer broadcasts it after it restarts, and the
+        # shell drops every icon it did not re-add itself. Without this the icon
+        # vanished for good while the process kept running (design §7).
+        self._taskbar_created = 0
 
     # -- public -----------------------------------------------------------
     @property
@@ -407,6 +413,7 @@ class TrayIcon:
                 return
             self._hwnd = int(hwnd)
             _instance = self
+            self._taskbar_created = int(api.RegisterWindowMessageW("TaskbarCreated") or 0)
             self._fallback_icon = int(api.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION)) or 0)
             if not self._add_icon():
                 self._ready.set()
@@ -451,7 +458,17 @@ class TrayIcon:
         api = _get_api()
         data = self._notify_data()
         if not api.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
-            self._error = f"Shell_NotifyIconW(NIM_ADD) failed (err={ctypes.get_last_error()})"
+            error = ctypes.get_last_error()
+            # The shell still holds this hWnd/uID (NIM_ADD refuses a duplicate),
+            # e.g. our own re-add after a TaskbarCreated broadcast that did not
+            # really reset the icon. NIM_MODIFY is the correct call then, and it
+            # is also what brings the icon back once the slot exists again.
+            if api.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)):
+                self._visible = True
+                log.info("tray icon re-registered (NIM_MODIFY, hwnd=%s state=%s)",
+                         self._hwnd, self._state)
+                return True
+            self._error = f"Shell_NotifyIconW(NIM_ADD) failed (err={error})"
             log.error(self._error)
             return False
         self._visible = True
@@ -460,6 +477,17 @@ class TrayIcon:
 
     def handle_message(self, hwnd, msg, wparam, lparam):   # pragma: no cover - Windows only
         api = _get_api()
+        if self._taskbar_created and msg == self._taskbar_created:
+            # Explorer restarted: the shell forgot every icon added with NIM_ADD
+            # and does not ask the old owners back. Re-add or the tool becomes
+            # invisible (the process would keep running with no way to reach
+            # 停止/再開/設定 from the tray).
+            self._visible = False
+            if self._add_icon():
+                log.info("tray icon re-added after an explorer restart")
+            else:
+                log.error("tray icon could not be re-added after an explorer restart")
+            return 0
         if msg == WM_TRAY:
             mouse = int(lparam) & 0xFFFF
             if mouse in (WM_RBUTTONUP, WM_CONTEXTMENU):

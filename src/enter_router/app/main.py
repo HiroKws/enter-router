@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from enter_router import __version__
-from enter_router.app import config_watcher, dryrun, logsetup, watchdog
+from enter_router.app import config_watcher, dryrun, logsetup, supervisor, watchdog
 from enter_router.app.controller import RouterStatus
 from enter_router.app.fgcache import ForegroundCache
 from enter_router.app.ime_unknown import ImeUnknownReporter
@@ -52,6 +52,11 @@ log = logging.getLogger("enter_router.app")
 EXIT_OK = 0
 EXIT_CONFIG = 2
 EXIT_WATCHDOG = 70
+
+#: How often the supervisor asks "is the hook still there?" (§6-1 companion).
+#: 2s is short enough that a lost hook is repaired before the user notices, and
+#: long enough that the check never competes with typing.
+SUPERVISOR_INTERVAL_S = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +161,11 @@ class EnterRouterApp:
         self._state = "paused"
         self._hook_installed = False
         self._hook_thread: threading.Thread | None = None
+        # Why we asked the hook to stop ("" = nobody did). Only an exit that
+        # nobody asked for is repaired; see _on_hook_exit / _check_hook.
+        self._hook_stop_intent = ""
+        self._repair_attempts = 0
+        self._supervisor_thread: threading.Thread | None = None
         self._last_error = ""
         self._last_sink_result = ""
         self._panic_done = False
@@ -583,10 +593,28 @@ class EnterRouterApp:
         self.panic_stop(f"callback_overbudget:{reason}", notify_user=True)
 
     def _on_hook_exit(self) -> None:
+        current = threading.current_thread()
+        if self._hook_thread is not None and current is not self._hook_thread:
+            # A stale hook thread (we already installed a newer one) reported its
+            # exit. Touching the state here would mark the *live* hook as gone.
+            log.info("stale hook thread exited (%s) — the current hook is untouched",
+                     current.name)
+            return
+        # Whoever asked for the stop says so first (set_enabled(False),
+        # _after_panic, shutdown). An empty intent means the loop ended on its
+        # own: that is the "it stopped by itself" case the supervisor repairs.
+        intent, self._hook_stop_intent = self._hook_stop_intent, ""
         with self._lock:
             self._hook_installed = False
-            if self._state == "running":
+            if intent and self._state == "running":
                 self._state = "paused"
+        if intent:
+            log.info("hook loop exited (reason=%s)", intent)
+        else:
+            # Keep the state "running" on purpose: the supervisor sees
+            # "running without a hook" and re-installs it, loudly.
+            log.error("hook loop exited without a stop request — the supervisor "
+                      "will re-install it")
         # The heartbeat source is gone, so the watchdog would see a stale beat a
         # few seconds later and self-exit with "応答が停止したため終了します" (measured
         # right after a panic: a second, bogus error toast). A missing hook is not
@@ -599,7 +627,6 @@ class EnterRouterApp:
             self._drain_injections()
         except BaseException:
             log.exception("draining pending injections on hook exit failed")
-        log.info("hook loop exited")
 
     def _after_panic(self, reason: str) -> None:
         if self._panic_done:
@@ -611,6 +638,7 @@ class EnterRouterApp:
             self._notify("enter-router", "パニック停止: キー横取りを停止しました", "warning")
         try:
             from enter_router.platform import hook as hook_mod
+            self._hook_stop_intent = "panic"      # we asked: do not auto-repair
             hook_mod.request_stop(f"panic:{reason}")
         except BaseException:
             log.exception("hook stop request failed")
@@ -619,16 +647,85 @@ class EnterRouterApp:
     def start(self) -> None:
         self._fg.start()
         self._worker.start()
-        self._watchdog_thread = watchdog.start(
-            self._monitor.last_beat_ms, self._cfg.safety.watchdog_interval_ms,
-            self._cfg.safety.watchdog_stale_ms, self._on_watchdog_trip)
+        self._start_watchdog()
         self._install_hook()
+        self._supervisor_thread = threading.Thread(target=self._supervise,
+                                                  name="hook-supervisor",
+                                                  daemon=True)
+        self._supervisor_thread.start()
         self._watcher = config_watcher.ConfigWatcher(
             self._config_path, self._apply_config, self._on_config_error).start()
         log.info("enter-router %s started (config=%s)", __version__, self._config_path)
 
+    # -- hook supervisor ----------------------------------------------------
+    def _supervise(self) -> None:
+        """Re-install the hook if the app says "running" but no hook is alive.
+
+        Runs off a plain timer, not the hook thread: it is the only thing left
+        that can notice the hook thread is gone (a dead loop thread has logged
+        its reason; a lost hook has not).
+        """
+        while not self._stopped.wait(SUPERVISOR_INTERVAL_S):
+            try:
+                self._check_hook()
+            except BaseException:
+                log.exception("hook supervisor check failed")
+
+    def _hook_alive(self) -> bool:
+        thread = self._hook_thread
+        return bool(self._hook_installed and thread is not None and thread.is_alive())
+
+    def _check_hook(self) -> None:
+        if self._hook_stop_intent:
+            return                      # a stop was requested: never fight it
+        with self._lock:
+            state = self._state
+        alive = self._hook_alive()
+        if not supervisor.needs_repair(state, self._hook_installed, alive):
+            if alive and self._repair_attempts:
+                self._repair_attempts = 0      # repaired for good: reset the count
+            return
+        self._repair_hook()
+
+    def _repair_hook(self) -> None:
+        self._repair_attempts += 1
+        attempt = self._repair_attempts
+        log.error("hook missing while running (attempt %d/%d) — re-installing",
+                  attempt, supervisor.MAX_REPAIR_ATTEMPTS)
+        self._last_error = f"hook lost (repair attempt {attempt})"
+        if supervisor.give_up(attempt):
+            # Stop fighting: the keyboard is free either way, so the honest
+            # state is "paused" plus one notification — not an endless retry.
+            with self._lock:
+                self._state = "paused"
+            log.error("hook repair gave up after %d attempts", attempt)
+            self._notify("enter-router",
+                         "キーフックが外れたままです（再装着に失敗）。"
+                         "トレイの「再開」で復帰してください。", "error")
+            return
+        self._install_hook()
+        if self._hook_installed:
+            log.info("hook re-installed (attempt %d)", attempt)
+            self._repair_attempts = 0
+
     def _install_hook(self) -> None:
         from enter_router.platform import hook as hook_mod
+
+        existing = self._hook_thread
+        if existing is not None and existing.is_alive():
+            if self._hook_installed:
+                # Never end up with two keyboard hooks: the second install would
+                # swallow nothing (the first one owns the swallow) but the handle
+                # bookkeeping would be wrong.
+                log.debug("hook thread is already running — not installing again")
+                return
+            # A stop is in flight (pause → resume clicked quickly). Wait for the
+            # old loop to finish instead of silently doing nothing.
+            existing.join(1.0)
+            if existing.is_alive():
+                log.warning("previous hook thread is still shutting down — "
+                            "not installing a second hook")
+                return
 
         def loop() -> None:
             try:
@@ -640,6 +737,7 @@ class EnterRouterApp:
                 self._last_error = f"hook install failed: {e}"
                 self._notify("enter-router", f"キーフックを開始できません: {e}", "error")
 
+        self._hook_stop_intent = ""
         self._hook_thread = threading.Thread(target=loop, name="hook", daemon=True)
         self._hook_thread.start()
         # SetWindowsHookExW reports failure immediately, but give it a moment so
@@ -651,8 +749,23 @@ class EnterRouterApp:
             time.sleep(0.02)
         self._hook_installed = hook_mod.current_handle() is not None
         self._monitor.heartbeat()
+        # The watchdog is stopped by _on_hook_exit (a missing hook is not a
+        # hang), so a re-install must start it again: without this the hang
+        # detection was silently gone for the rest of the process lifetime after
+        # the first pause/resume.
+        if self._hook_installed:
+            self._start_watchdog()
         with self._lock:
             self._state = "running" if self._hook_installed else "paused"
+
+    def _start_watchdog(self) -> None:
+        running = self._watchdog_thread
+        if running is not None and running.is_alive():
+            return
+        self._monitor.heartbeat()
+        self._watchdog_thread = watchdog.start(
+            self._monitor.last_beat_ms, self._cfg.safety.watchdog_interval_ms,
+            self._cfg.safety.watchdog_stale_ms, self._on_watchdog_trip)
 
     def _on_mouse(self) -> None:
         with self._lock:
@@ -678,6 +791,7 @@ class EnterRouterApp:
 
     def shutdown(self) -> None:
         log.info("shutting down")
+        self._hook_stop_intent = "shutdown"       # an orderly stop, not a repair
         out = None
         try:
             from enter_router.platform import hook as hook_mod
@@ -872,10 +986,12 @@ class EnterRouterApp:
             self._execute(out, None)          # outside the lock (review item 2)
         if enabled:
             self._panic_done = False
+            self._repair_attempts = 0
             if not self._hook_installed:
                 self._install_hook()
         else:
             from enter_router.platform import hook as hook_mod
+            self._hook_stop_intent = "paused"     # we asked: do not auto-repair
             hook_mod.request_stop("paused")
             self._hook_installed = False
             self._state = "paused"
