@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 
 from enter_router.core.config import LoggingConfig
@@ -108,4 +109,53 @@ def setup(cfg: LoggingConfig, appdata: str, console: bool = False) -> str:
     root.info("logging started file=%s level=%s console=%s",
               path, cfg.level, console)
     _install_process_hooks(log_dir)
+    prune(log_dir)                     # keep the folder bounded across restarts
     return path
+
+
+# ---------------------------------------------------------------------------
+# retention: rotating handlers bound today's file, this bounds the folder
+# ---------------------------------------------------------------------------
+#: Rotated generations older than this are deleted (the live file is never
+#: touched — the handler owns it).
+KEEP_DAYS = 7
+#: Set by setup(); the resident app's daily pruner needs the folder too.
+LOG_DIR: str | None = None
+
+
+def prune(log_dir: str, keep_days: int = KEEP_DAYS, now: float | None = None) -> list[str]:
+    """Delete rotated log generations older than ``keep_days``.
+
+    The rotating handler already caps one file (``max_bytes`` x ``backup_count``),
+    but nothing ever removed them: after a few weeks the folder held every
+    generation anyone had ever produced. The live files (``enter-router.log`` and
+    an open ``crash.log``) are never touched.
+
+    Returns the deleted paths (tests assert on them).
+    """
+    global LOG_DIR
+    LOG_DIR = log_dir or LOG_DIR
+    if not log_dir or not os.path.isdir(log_dir):
+        return []
+    cutoff = (now if now is not None else time.time()) - keep_days * 86400
+    removed: list[str] = []
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return []
+    for name in names:
+        if name not in ("crash.log",) and not name.startswith("crash.log."):
+            if not (name.startswith("enter-router.log.")
+                    or name.startswith("enter-router.log-")):
+                continue
+        if name == "crash.log" and _crash_file is not None:
+            continue                   # faulthandler is writing to it
+        path = os.path.join(log_dir, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed.append(path)
+        except OSError:
+            pass
+    return removed
+

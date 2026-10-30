@@ -64,6 +64,10 @@ SUPERVISOR_INTERVAL_S = 2.0
 #: enough that the user does not see it.
 SEND_CLEANUP_DELAY_S = 0.08
 
+#: How often the resident process removes rotated log generations older than
+#: ``logsetup.KEEP_DAYS`` (6h: cheap, and a machine left on never restarts).
+RETENTION_INTERVAL_S = 6 * 3600.0
+
 
 # ---------------------------------------------------------------------------
 # small infrastructure
@@ -712,9 +716,28 @@ class EnterRouterApp:
                                                   name="hook-supervisor",
                                                   daemon=True)
         self._supervisor_thread.start()
+        self._start_log_retention()
         self._watcher = config_watcher.ConfigWatcher(
             self._config_path, self._apply_config, self._on_config_error).start()
         log.info("enter-router %s started (config=%s)", __version__, self._config_path)
+
+    # -- log retention ------------------------------------------------------
+    def _start_log_retention(self) -> None:
+        """Trim old log generations every few hours, not only at startup.
+
+        The resident process lives for days, so a startup-only prune would never
+        run for a machine that is left on.
+        """
+        def loop() -> None:
+            while not self._stopped.wait(RETENTION_INTERVAL_S):
+                try:
+                    removed = logsetup.prune(logsetup.LOG_DIR or "")
+                    if removed:
+                        log.info("log retention removed %d old file(s)", len(removed))
+                except BaseException:
+                    log.exception("log retention failed")
+
+        threading.Thread(target=loop, name="log-retention", daemon=True).start()
 
     # -- hook supervisor ----------------------------------------------------
     def _supervise(self) -> None:
